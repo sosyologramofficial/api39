@@ -3113,7 +3113,7 @@ def generate_ai_video_service(
 
 ACCOUNT_CONFIG = {
     # İki yeni hesap açılışı arasındaki minimum bekleme süresi (sn) [2 dakika]:
-    "account_creation_interval_sec": 120,
+    "account_creation_interval_sec": 60,
 
     # İki görev gönderimi arasındaki minimum bekleme süresi (sn) [1 dakika]:
     "task_interval_sec": 60,
