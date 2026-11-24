@@ -2088,37 +2088,78 @@ def encrypt_myedit_aes_gcm_hex(aes_key: bytes, raw_bytes: bytes, timestamp_ms: i
     return cipher_bytes.hex()
 
 def get_subscription_token(member_token: str) -> str:
+    # subscriptions/auth istekleri, yeni hesap açılışlarında (500 'Unable to get total space')
+    # veya anlık istek çakışmalarında (429 'Too many requests') geçici hatalar verebilir.
+    # Görevin hemen düşmemesi için 5 saniye arayla maksimum 3 kez denenir.
+    max_retries = 3
+    retry_delay_sec = 5
+
     rsa_pub_key = get_myedit_rsa_public_key()
-    aes_key = AESGCM.generate_key(bit_length=256)
-    ts_ms = int(time.time() * 1000)
+    last_resp = None
 
-    key_param = rsa_encrypt_aes_key(rsa_pub_key, aes_key)
-    cl_sid_json = json.dumps({"cl_sid": [SID_AOL_POL]}, separators=(',', ':'))
-    receipt_param = encrypt_myedit_aes_gcm(aes_key, cl_sid_json, ts_ms, 0)
+    for attempt in range(max_retries):
+        aes_key = AESGCM.generate_key(bit_length=256)
+        ts_ms = int(time.time() * 1000)
 
-    headers = {
-        "User-Agent": HEADERS["User-Agent"],
-        "Authorization": f"Bearer {member_token}",
-        "Content-Type": "application/json",
-        "Origin": "https://myedit.online",
-        "Referer": "https://myedit.online/",
-    }
-    body = {
-        "product": "myedit",
-        "version": "3.9.0",
-        "versiontype": "3.9.0",
-        "platform": "web",
-        "receipt": receipt_param,
-        "key": key_param,
-        "timestamp": ts_ms,
-    }
-    resp = requests.post(SUB_AUTH_URL, json=body, headers=headers, timeout=30)
-    if resp.status_code == 401:
-        raise AuthExpiredError(f"Auth token expired on subscriptions/auth: {resp.text}")
-    if resp.status_code == 403:
-        raise CreditExhaustedError(f"Subscription auth forbidden/exhausted: {resp.text}")
-    resp.raise_for_status()
-    return resp.json()["subscription_token"]
+        key_param = rsa_encrypt_aes_key(rsa_pub_key, aes_key)
+        cl_sid_json = json.dumps({"cl_sid": [SID_AOL_POL]}, separators=(',', ':'))
+        receipt_param = encrypt_myedit_aes_gcm(aes_key, cl_sid_json, ts_ms, 0)
+
+        headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Authorization": f"Bearer {member_token}",
+            "Content-Type": "application/json",
+            "Origin": "https://myedit.online",
+            "Referer": "https://myedit.online/",
+        }
+        body = {
+            "product": "myedit",
+            "version": "3.9.0",
+            "versiontype": "3.9.0",
+            "platform": "web",
+            "receipt": receipt_param,
+            "key": key_param,
+            "timestamp": ts_ms,
+        }
+
+        try:
+            resp = requests.post(SUB_AUTH_URL, json=body, headers=headers, timeout=30)
+            last_resp = resp
+
+            # 401 token süresi bitti ve 403 kredi bitti durumları beklemeksizin hesap değişimine yönlendirilir
+            if resp.status_code == 401:
+                raise AuthExpiredError(f"Auth token expired on subscriptions/auth: {resp.text}")
+            if resp.status_code == 403:
+                raise CreditExhaustedError(f"Subscription auth forbidden/exhausted: {resp.text}")
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if "subscription_token" in data:
+                    return data["subscription_token"]
+
+            # 429 (rate-limit) veya 500 (geçici bulut alanı senkronizasyon) hatasında 5 sn bekle ve tekrar dene
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt < max_retries - 1:
+                    print(f"[SUB_AUTH] Geçici sunucu cevabı ({resp.status_code}). {retry_delay_sec} sn sonra tekrar deneniyor ({attempt+1}/{max_retries})...")
+                    time.sleep(retry_delay_sec)
+                    continue
+
+            resp.raise_for_status()
+            return resp.json()["subscription_token"]
+
+        except (AuthExpiredError, CreditExhaustedError):
+            raise
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                print(f"[SUB_AUTH] Bağlantı hatası ({e}). {retry_delay_sec} sn sonra tekrar deneniyor ({attempt+1}/{max_retries})...")
+                time.sleep(retry_delay_sec)
+                continue
+            raise
+
+    if last_resp is not None:
+        last_resp.raise_for_status()
+    raise RuntimeError("subscriptions/auth token 3 deneme sonucunda alınamadı.")
+
 
 def format_error_code(error) -> str:
     """Returns strictly the HTTP status code (e.g. '429', '500', '503', '504') for client/frontend log visibility."""
@@ -3139,7 +3180,15 @@ LAST_ACCOUNT_CREATION_TIME = {} # {api_key_id: timestamp}
 ACCOUNT_TIME_LOCK = threading.Lock()
 
 LAST_TASK_DISPATCH_TIME = {} # {api_key_id: timestamp}
-TASK_INTERVAL_LOCK = threading.Lock()
+TASK_DISPATCH_LOCKS = {} # {api_key_id: threading.Lock()}
+TASK_LOCK_MUTEX = threading.Lock()
+
+def get_task_dispatch_lock(api_key_id):
+    """Her api_key_id icin ozel bir gorev gonderim sirasi kilidi doner."""
+    with TASK_LOCK_MUTEX:
+        if api_key_id not in TASK_DISPATCH_LOCKS:
+            TASK_DISPATCH_LOCKS[api_key_id] = threading.Lock()
+        return TASK_DISPATCH_LOCKS[api_key_id]
 
 LAST_ERROR_TIME = {} # {api_key_id: timestamp}
 ERROR_TIME_LOCK = threading.Lock()
@@ -3181,21 +3230,24 @@ def record_account_creation_time(api_key_id):
         LAST_ACCOUNT_CREATION_TIME[api_key_id] = time.time()
 
 def wait_for_task_interval(api_key_id):
-    """İki görev gönderimi arasında en az task_interval_sec (60s) bekleme sağlar (kilit dışı uyur)."""
+    """İki görev gönderimi arasında en az task_interval_sec bekleme sağlar.
+    Aynı API anahtarına ait paralel görevlerin aynı anda MyEdit'e vurmasını engellemek için
+    görev kilidi (task_dispatch_lock) ile sıraya sokar.
+    """
     interval = ACCOUNT_CONFIG.get("task_interval_sec", 60)
     if interval <= 0:
         return
-    with TASK_INTERVAL_LOCK:
+
+    task_lock = get_task_dispatch_lock(api_key_id)
+    with task_lock:
         last_time = LAST_TASK_DISPATCH_TIME.get(api_key_id, 0)
         elapsed = time.time() - last_time
         wait_sec = interval - elapsed if elapsed < interval else 0
-        if wait_sec == 0:
-            LAST_TASK_DISPATCH_TIME[api_key_id] = time.time()
-    if wait_sec > 0:
-        print(f"[TASK] Görevler arası bekleme kuralı ({interval}s). {wait_sec:.1f} saniye bekleniyor...")
-        time.sleep(wait_sec)
-        with TASK_INTERVAL_LOCK:
-            LAST_TASK_DISPATCH_TIME[api_key_id] = time.time()
+        if wait_sec > 0:
+            print(f"[TASK] Görevler arası bekleme kuralı ({interval}s). {wait_sec:.1f} saniye bekleniyor...")
+            time.sleep(wait_sec)
+        LAST_TASK_DISPATCH_TIME[api_key_id] = time.time()
+
 
 def get_creation_lock(api_key_id):
     """Her api_key_id icin ozel bir hesap acma kilidi doner."""
